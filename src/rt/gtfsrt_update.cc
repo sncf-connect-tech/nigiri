@@ -625,6 +625,11 @@ statistics gtfsrt_update_msg(timetable const& tt,
                      msg.header().timestamp());
   span->SetAttribute("nigiri.gtfsrt.total_entities", msg.entity_size());
 
+  // Deferred cancellations: process after all update_run() calls to prevent
+  // a subsequent update_run() for the same trip in the same feed from
+  // resetting rt_transport_is_cancelled_ back to false.
+  auto deferred_cancels = std::vector<run>{};
+
   for (auto const& entity : msg.entity()) {
     auto const unsupported = [&](bool const is_set, char const* field,
                                  int& stat) {
@@ -752,7 +757,22 @@ statistics gtfsrt_update_msg(timetable const& tt,
         resolve_rt(rtt, r, trip_id, src);
 
         if (sr == gtfsrt::TripDescriptor_ScheduleRelationship_CANCELED) {
-          rtt.cancel_run(r);
+          // Ensure an RT transport exists before calling cancel_run(). Without
+          // one, cancel_run() can only remove the day from the static bitfield,
+          // which makes the trip disappear from routing entirely instead of
+          // appearing with cancelled=true.
+          // An RT transport only exists if a prior stop_time_update was already
+          // received for this trip. If this CANCELED is the first RT message
+          // (no previous delay/update), r.is_rt() is false and we must create
+          // the RT transport first by calling update_run(), so that cancel_run()
+          // can correctly set rt_transport_is_cancelled_=true.
+          // cancel_run() itself is deferred (see deferred_cancels below) to
+          // ensure it runs after all update_run() calls in the feed, preventing
+          // a subsequent update_run() from resetting the cancelled flag.
+          if (!added && !r.is_rt()) {
+            update_run(src, tt, rtt, trip, r, entity.trip_update());
+          }
+          deferred_cancels.push_back(r);
           ++stats.total_entities_success_;
         } else if (!added) {
           if (update_run(src, tt, rtt, trip, r, entity.trip_update())) {
@@ -804,6 +824,10 @@ statistics gtfsrt_update_msg(timetable const& tt,
                       {"entity.id", entity.id()},
                       {"message", remove_nl(entity.DebugString())}});
     }
+  }
+
+  for (auto const& r : deferred_cancels) {
+    rtt.cancel_run(r);
   }
 
   return stats;
